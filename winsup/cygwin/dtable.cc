@@ -369,7 +369,7 @@ dtable::init_std_file_from_handle (int fd, HANDLE handle)
       int openflags = O_BINARY;
 
       /* Console windows are no kernel objects up to Windows 7/2008R2, so the
-      	 access mask returned by NtQueryInformationFile is meaningless.  CMD
+	 access mask returned by NtQueryInformationFile is meaningless.  CMD
 	 always hands down stdin handles as R/O handles, but our tty slave
 	 sides are R/W. */
       if (fh->is_tty ())
@@ -647,7 +647,7 @@ build_fh_pc (path_conv& pc)
   else if ((fh->archetype = cygheap->fdtab.find_archetype (fh->dev ())))
     {
       debug_printf ("found an archetype for %s(%d/%d) io_handle %p", fh->get_name (), fh->dev ().get_major (), fh->dev ().get_minor (),
-		    fh->archetype->get_io_handle ());
+		    fh->archetype->get_handle ());
       if (!fh->get_name ())
 	fh->set_name (fh->archetype->dev ().name ());
     }
@@ -679,16 +679,13 @@ out:
 fhandler_base *
 dtable::dup_worker (fhandler_base *oldfh, int flags)
 {
-  /* Don't call set_name in build_fh_pc.  It will be called in
-     fhandler_base::operator= below.  Calling it twice will result
-     in double allocation. */
   fhandler_base *newfh = oldfh->clone ();
   if (!newfh)
-    debug_printf ("build_fh_pc failed");
+    debug_printf ("clone failed");
   else
     {
       if (!oldfh->archetype)
-	newfh->set_io_handle (NULL);
+	newfh->set_handle (NULL);
 
       newfh->pc.reset_conv_handle ();
       if (oldfh->dup (newfh, flags))
@@ -708,7 +705,7 @@ dtable::dup_worker (fhandler_base *oldfh, int flags)
 	  /* The O_CLOEXEC flag enforces close-on-exec behaviour. */
 	  newfh->set_close_on_exec (!!(flags & O_CLOEXEC));
 	  debug_printf ("duped '%s' old %p, new %p", oldfh->get_name (),
-			oldfh->get_io_handle (), newfh->get_io_handle ());
+			oldfh->get_handle (), newfh->get_handle ());
 	}
     }
   return newfh;
@@ -765,7 +762,7 @@ dtable::dup3 (int oldfd, int newfd, int flags)
     }
 
   debug_printf ("newfh->io_handle %p, oldfh->io_handle %p, new win32_name %p, old win32_name %p",
-		newfh->get_io_handle (), fds[oldfd]->get_io_handle (), newfh->get_win32_name (), fds[oldfd]->get_win32_name ());
+		newfh->get_handle (), fds[oldfd]->get_handle (), newfh->get_win32_name (), fds[oldfd]->get_win32_name ());
 
   if (!not_open (newfd))
     close (newfd);
@@ -891,12 +888,12 @@ dtable::fixup_after_exec ()
 	/* Close the handle if it's close-on-exec or if an error was detected
 	   (typically with opening a console in a gui app) by fixup_after_exec.
 	 */
-	if (fh->close_on_exec () || (!fh->nohandle () && !fh->get_io_handle ()))
+	if (fh->close_on_exec () || (!fh->nohandle () && !fh->get_handle ()))
 	  fixup_close (i, fh);
 	else if (fh->get_popen_pid ())
 	  close (i);
 	else if (i == 0)
-	  SetStdHandle (std_consts[i], fh->get_io_handle ());
+	  SetStdHandle (std_consts[i], fh->get_handle ());
 	else if (i <= 2)
 	  SetStdHandle (std_consts[i], fh->get_output_handle ());
       }
@@ -913,7 +910,7 @@ dtable::fixup_after_fork (HANDLE parent)
 	  {
 	    debug_printf ("fd %d (%s)", i, fh->get_name ());
 	    fh->fixup_after_fork (parent);
-	    if (!fh->nohandle () && !fh->get_io_handle ())
+	    if (!fh->nohandle () && !fh->get_handle ())
 	      {
 		/* This should actually never happen but it's here to make sure
 		   we don't crash due to access of an unopened file handle.  */
@@ -922,7 +919,7 @@ dtable::fixup_after_fork (HANDLE parent)
 	      }
 	  }
 	if (i == 0)
-	  SetStdHandle (std_consts[i], fh->get_io_handle ());
+	  SetStdHandle (std_consts[i], fh->get_handle ());
 	else if (i <= 2)
 	  SetStdHandle (std_consts[i], fh->get_output_handle ());
       }

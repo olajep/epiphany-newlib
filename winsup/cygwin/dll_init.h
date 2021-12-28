@@ -59,13 +59,13 @@ struct dll
   DWORD image_size;
   void* preferred_base;
   PWCHAR modname;
-  FILE_BASIC_INFORMATION fbi;
   FILE_INTERNAL_INFORMATION fii;
   PWCHAR forkable_ntname;
   WCHAR ntname[1]; /* must be the last data member */
 
   void detach ();
   int init ();
+  bool stat_real_file_once ();
   void nominate_forkable (PCWCHAR);
   bool create_forkable ();
   void run_dtors ()
@@ -119,7 +119,6 @@ public:
 			    ULONG openopts = 0, ACCESS_MASK access = 0,
 			    HANDLE rootDir = NULL);
   static bool read_fii (HANDLE fh, PFILE_INTERNAL_INFORMATION pfii);
-  static bool read_fbi (HANDLE fh, PFILE_BASIC_INFORMATION pfbi);
   static PWCHAR form_ntname (PWCHAR ntbuf, size_t bufsize, PCWCHAR name);
   static PWCHAR form_shortname (PWCHAR shortbuf, size_t bufsize, PCWCHAR name);
   static PWCHAR nt_max_path_buf ()

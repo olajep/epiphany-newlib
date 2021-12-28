@@ -114,7 +114,7 @@ struct OLD_msghdr
   struct iovec *	msg_iov;	/* Data blocks			*/
   int			msg_iovlen;	/* Number of blocks		*/
   void *		msg_accrights;	/* Per protocol magic		*/
-  					/* (eg BSD descriptor passing)	*/
+					/* (eg BSD descriptor passing)	*/
   int			msg_accrightslen; /* Length of rights list	*/
 };
 #endif
@@ -207,6 +207,8 @@ struct OLD_msghdr
 /* AF_UNIX specific */
 #define MSG_CMSG_CLOEXEC 0x1000		/* Set O_CLOEXEC on fd's passed via
 					   SCM_RIGHTS */
+/* MSG_EOR is not supported.  We use the MSG_PARTIAL flag here */
+#define MSG_EOR		0x8000		/* Terminates a record */
 
 /* Setsockoptions(2) level. Thanks to BSD these must match IPPROTO_xxx */
 #define SOL_IP		0
@@ -297,12 +299,6 @@ struct OLD_msghdr
 
 /* IPX options */
 #define IPX_TYPE	1
-
-/* TCP options - this way around because someone left a set in the c library includes */
-#ifndef TCP_NODELAY
-#define TCP_NODELAY     0x0001
-#define TCP_MAXSEG	2
-#endif
 
 /* SUS symbolic values for the second parm to shutdown(2) */
 #define SHUT_RD   0		/* == Win32 SD_RECEIVE */

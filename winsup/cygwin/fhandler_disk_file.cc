@@ -212,7 +212,7 @@ fhandler_base::fstat_by_nfs_ea (struct stat *buf)
   cyg_ldap cldap;
   bool ldap_open = false;
 
-  if (get_io_handle ())
+  if (get_handle ())
     {
       /* NFS stumbles over its own caching.  If you write to the file,
 	 a subsequent fstat does not return the actual size of the file,
@@ -220,8 +220,8 @@ fhandler_base::fstat_by_nfs_ea (struct stat *buf)
 	 access through another handle invalidates the caching within the
 	 NFS client. */
       if (get_access () & GENERIC_WRITE)
-	FlushFileBuffers (get_io_handle ());
-      pc.get_finfo (get_io_handle ());
+	FlushFileBuffers (get_handle ());
+      pc.get_finfo (get_handle ());
     }
   buf->st_dev = nfs_attr->fsid;
   buf->st_ino = nfs_attr->fileid;
@@ -291,7 +291,7 @@ fhandler_base::fstat_by_handle (struct stat *buf)
 
   /* If the file has been opened for other purposes than stat, we can't rely
      on the information stored in pc.fai.  So we overwrite them here. */
-  if (get_io_handle ())
+  if (get_handle ())
     {
       status = pc.get_finfo (h);
       if (!NT_SUCCESS (status))
@@ -359,7 +359,7 @@ fhandler_base::fstat_fs (struct stat *buf)
 
   if (get_stat_handle ())
     {
-      if (!nohandle () && !is_fs_special ())
+      if (!nohandle () && (!is_fs_special () || get_flags () & O_PATH))
 	res = pc.fs_is_nfs () ? fstat_by_nfs_ea (buf) : fstat_by_handle (buf);
       if (res)
 	res = fstat_by_name (buf);
@@ -386,7 +386,7 @@ fhandler_base::fstat_fs (struct stat *buf)
       nohandle (false);
       close_fs ();
       nohandle (no_handle);
-      set_io_handle (NULL);
+      set_handle (NULL);
     }
   if (res)
     res = fstat_by_name (buf);
@@ -394,12 +394,13 @@ fhandler_base::fstat_fs (struct stat *buf)
   return res;
 }
 
+/* Called by fstat_by_handle and fstat_by_name. */
 int __reg2
 fhandler_base::fstat_helper (struct stat *buf)
 {
   IO_STATUS_BLOCK st;
   FILE_COMPRESSION_INFORMATION fci;
-  HANDLE h = get_stat_handle ();
+  HANDLE h = get_stat_handle ();      /* Should always be pc.handle(). */
   PFILE_ALL_INFORMATION pfai = pc.fai ();
   ULONG attributes = pc.file_attributes ();
 
@@ -475,12 +476,12 @@ fhandler_base::fstat_helper (struct stat *buf)
   else if (pc.issocket ())
     buf->st_mode = S_IFSOCK;
 
-  if (!get_file_attribute (is_fs_special () && !pc.issocket () ? NULL : h, pc,
-			   &buf->st_mode, &buf->st_uid, &buf->st_gid))
+  if (!get_file_attribute (h, pc, &buf->st_mode, &buf->st_uid,
+			   &buf->st_gid))
     {
       /* If read-only attribute is set, modify ntsec return value */
       if (::has_attribute (attributes, FILE_ATTRIBUTE_READONLY)
-	  && !pc.isdir () && !pc.issymlink ())
+	  && !pc.isdir () && !pc.issymlink () && !pc.is_fs_special ())
 	buf->st_mode &= ~(S_IWUSR | S_IWGRP | S_IWOTH);
 
       if (buf->st_mode & S_IFMT)
@@ -600,9 +601,7 @@ int __reg2
 fhandler_disk_file::fstatvfs (struct statvfs *sfs)
 {
   int ret = -1, opened = 0;
-  NTSTATUS status;
   IO_STATUS_BLOCK io;
-  FILE_FS_FULL_SIZE_INFORMATION full_fsi;
   /* We must not use the stat handle here, even if it exists.  The handle
      has been opened with FILE_OPEN_REPARSE_POINT, thus, in case of a volume
      mount point, it points to the FS of the mount point, rather than to the
@@ -629,6 +628,22 @@ fhandler_disk_file::fstatvfs (struct statvfs *sfs)
 	    goto out;
 	}
     }
+
+  ret = fstatvfs_by_handle (fh, sfs);
+out:
+  if (opened)
+    NtClose (fh);
+  syscall_printf ("%d = fstatvfs(%s, %p)", ret, get_name (), sfs);
+  return ret;
+}
+
+int __reg2
+fhandler_base::fstatvfs_by_handle (HANDLE fh, struct statvfs *sfs)
+{
+  int ret = -1;
+  NTSTATUS status;
+  IO_STATUS_BLOCK io;
+  FILE_FS_FULL_SIZE_INFORMATION full_fsi;
 
   sfs->f_files = ULONG_MAX;
   sfs->f_ffree = ULONG_MAX;
@@ -681,24 +696,19 @@ fhandler_disk_file::fstatvfs (struct statvfs *sfs)
 	}
       else
 	debug_printf ("%y = NtQueryVolumeInformationFile"
-		      "(%S, FileFsSizeInformation)", 
+		      "(%S, FileFsSizeInformation)",
 		      status, pc.get_nt_native_path ());
     }
   else
     debug_printf ("%y = NtQueryVolumeInformationFile"
-		  "(%S, FileFsFullSizeInformation)", 
+		  "(%S, FileFsFullSizeInformation)",
 		  status, pc.get_nt_native_path ());
-out:
-  if (opened)
-    NtClose (fh);
-  syscall_printf ("%d = fstatvfs(%s, %p)", ret, get_name (), sfs);
   return ret;
 }
 
 int __reg1
 fhandler_disk_file::fchmod (mode_t mode)
 {
-  extern int chmod_device (path_conv& pc, mode_t mode);
   int ret = -1;
   int oret = 0;
   NTSTATUS status;
@@ -817,7 +827,7 @@ fhandler_disk_file::fchmod (mode_t mode)
       HANDLE fh;
 
       if (NT_SUCCESS (NtOpenFile (&fh, FILE_WRITE_ATTRIBUTES,
-      				  pc.init_reopen_attr (attr, get_handle ()),
+				  pc.init_reopen_attr (attr, get_handle ()),
 				  &io, FILE_SHARE_VALID_FLAGS,
 				  FILE_OPEN_FOR_BACKUP_INTENT)))
 	{
@@ -1190,10 +1200,10 @@ fhandler_disk_file::link (const char *newpath)
   char new_buf[nlen + 5];
   if (!newpc.error)
     {
-      /* If the original file is a lnk special file (except for sockets),
+      /* If the original file is a lnk special file,
 	 and if the original file has a .lnk suffix, add one to the hardlink
 	 as well. */
-      if (pc.is_lnk_special () && !pc.issocket ()
+      if (pc.is_lnk_special ()
 	  && RtlEqualUnicodePathSuffix (pc.get_nt_native_path (),
 					&ro_u_lnk, TRUE))
 	{
@@ -1459,13 +1469,13 @@ fhandler_base::open_fs (int flags, mode_t mode)
 
   bool new_file = !exists ();
 
-  int res = fhandler_base::open (flags | O_DIROPEN, mode);
+  int res = fhandler_base::open (flags, mode);
   if (res)
     {
       /* The file info in pc is wrong at this point for newly created files.
 	 Refresh it before fetching any file info. */
       if (new_file)
-	pc.get_finfo (get_io_handle ());
+	pc.get_finfo (get_handle ());
 
       if (pc.isgood_inode (pc.get_ino ()))
 	ino = pc.get_ino ();
@@ -2053,7 +2063,7 @@ readdir_get_ino (const char *path, bool dot_dot)
       strcpy (c, "..");
       path = fname;
     }
-  path_conv pc (path, PC_SYM_NOFOLLOW | PC_POSIX | PC_NOWARN | PC_KEEP_HANDLE);
+  path_conv pc (path, PC_SYM_NOFOLLOW | PC_POSIX | PC_KEEP_HANDLE);
   if (pc.isspecial ())
     {
       if (!stat_worker (pc, &st))
@@ -2615,7 +2625,7 @@ fhandler_disk_file::fs_ioc_setflags (uint64_t flags)
       if (fh != get_handle ())
 	NtClose (fh);
       NtClose (get_handle ());
-      set_io_handle (NULL);
+      set_handle (NULL);
 
       pc.get_wide_win32_path (path);
       cret = (flags & FS_ENCRYPT_FL)
@@ -2630,7 +2640,7 @@ fhandler_disk_file::fs_ioc_setflags (uint64_t flags)
 	  __seterrno_from_nt_status (status);
 	  return -1;
 	}
-      set_io_handle (fh);
+      set_handle (fh);
       if (!cret)
 	{
 	  __seterrno ();

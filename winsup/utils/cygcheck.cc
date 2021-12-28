@@ -62,8 +62,6 @@ void package_find (int, char **);
 void package_list (int, char **);
 /* In bloda.cc  */
 void dump_dodgy_apps (int verbose);
-/* Forward declaration */
-static void usage (FILE *, int);
 
 static const char *known_env_vars[] = {
   "c_include_path",
@@ -99,28 +97,43 @@ static common_apps[] = {
   {"awk", 0},
   {"bash", 0},
   {"cat", 0},
+  {"certutil", 0},
+  {"clinfo", 0},
+  {"comp", 0},
+  {"convert", 0},
   {"cp", 0},
   {"cpp", 1},
   {"crontab", 0},
+  {"curl", 0},
+  {"expand", 0},
   {"find", 0},
+  {"ftp", 0},
   {"gcc", 0},
   {"gdb", 0},
   {"grep", 0},
+  {"hostname", 0},
   {"kill", 0},
+  {"klist", 0},
   {"ld", 0},
   {"ls", 0},
   {"make", 0},
   {"mv", 0},
+  {"nslookup", 0},
   {"patch", 0},
   {"perl", 0},
+  {"replace", 0},
   {"rm", 0},
   {"sed", 0},
-  {"ssh", 0},
   {"sh", 0},
+  {"shutdown", 0},
+  {"sort", 0},
+  {"ssh", 0},
   {"tar", 0},
   {"test", 0},
+  {"timeout", 0},
   {"vi", 0},
   {"vim", 0},
+  {"whoami", 0},
   {0, 0}
 };
 
@@ -2095,7 +2108,7 @@ package_grep (char *search)
   return 0;
 }
 
-static void
+static void __attribute__ ((__noreturn__))
 usage (FILE * stream, int status)
 {
   fprintf (stream, "\

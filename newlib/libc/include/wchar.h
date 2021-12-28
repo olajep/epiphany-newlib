@@ -64,7 +64,7 @@ typedef __gnuc_va_list va_list;
 #endif
 
 #if __POSIX_VISIBLE >= 200809
-#include <xlocale.h>
+#include <sys/_locale.h>
 #endif
 
 _BEGIN_STD_C
@@ -248,8 +248,8 @@ int _fputws_unlocked_r (struct _reent *, const wchar_t *, __FILE *);
 int _fwide_r (struct _reent *, __FILE *, int);
 wint_t _getwc_r (struct _reent *, __FILE *);
 wint_t _getwc_unlocked_r (struct _reent *, __FILE *);
-wint_t _getwchar_r (struct _reent *ptr);
-wint_t _getwchar_unlocked_r (struct _reent *ptr);
+wint_t _getwchar_r (struct _reent *);
+wint_t _getwchar_unlocked_r (struct _reent *);
 wint_t _putwc_r (struct _reent *, wchar_t, __FILE *);
 wint_t _putwc_unlocked_r (struct _reent *, wchar_t, __FILE *);
 wint_t _putwchar_r (struct _reent *, wchar_t);

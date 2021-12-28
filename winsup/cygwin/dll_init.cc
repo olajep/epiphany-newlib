@@ -372,7 +372,6 @@ dll_list::alloc (HINSTANCE h, per_process *p, dll_type type)
       d->image_size = ((pefile*)h)->optional_hdr ()->SizeOfImage;
       d->preferred_base = (void*) ((pefile*)h)->optional_hdr()->ImageBase;
       d->type = type;
-      d->fbi.FileAttributes = INVALID_FILE_ATTRIBUTES;
       d->fii.IndexNumber.QuadPart = -1LL;
       if (!forkntsize)
 	d->forkable_ntname = NULL;
@@ -381,6 +380,8 @@ dll_list::alloc (HINSTANCE h, per_process *p, dll_type type)
 	  d->forkable_ntname = d->ntname + ntnamelen + 1;
 	  *d->forkable_ntname = L'\0';
 	}
+      if (forkables_supported ())
+	d->stat_real_file_once ();
       append (d);
       if (type == DLL_LOAD)
 	loaded_dlls++;

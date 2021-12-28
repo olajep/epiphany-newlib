@@ -194,6 +194,24 @@ handle (int fd, bool writing)
   return h;
 }
 
+static bool
+is_console_app (WCHAR *filename)
+{
+  HANDLE h;
+  const int id_offset = 92;
+  h = CreateFileW (filename, GENERIC_READ, FILE_SHARE_READ,
+		  NULL, OPEN_EXISTING, 0, NULL);
+  char buf[1024];
+  DWORD n;
+  ReadFile (h, buf, sizeof (buf), &n, 0);
+  CloseHandle (h);
+  char *p = (char *) memmem (buf, n, "PE\0\0", 4);
+  if (p && p + id_offset <= buf + n)
+    return p[id_offset] == '\003'; /* 02: GUI, 03: console */
+  else
+    return false;
+}
+
 int
 iscmd (const char *argv0, const char *what)
 {
@@ -252,6 +270,8 @@ struct system_call_handle
 
 child_info_spawn NO_COPY ch_spawn;
 
+extern "C" void __posix_spawn_sem_release (void *sem, int error);
+
 int
 child_info_spawn::worker (const char *prog_arg, const char *const *argv,
 			  const char *const envp[], int mode,
@@ -259,6 +279,21 @@ child_info_spawn::worker (const char *prog_arg, const char *const *argv,
 {
   bool rc;
   int res = -1;
+  pid_t ctty_pgid = 0;
+
+  /* Search for CTTY and retrieve its PGID */
+  cygheap_fdenum cfd (false);
+  while (cfd.next () >= 0)
+    if (cfd->get_major () == DEV_PTYS_MAJOR ||
+	cfd->get_major () == DEV_CONS_MAJOR)
+      {
+	fhandler_termios *fh = (fhandler_termios *) (fhandler_base *) cfd;
+	if (fh->tc ()->ntty == myself->ctty)
+	  {
+	    ctty_pgid = fh->tc ()->getpgid ();
+	    break;
+	  }
+      }
 
   /* Check if we have been called from exec{lv}p or spawn{lv}p and mask
      mode to keep only the spawn mode. */
@@ -391,18 +426,17 @@ child_info_spawn::worker (const char *prog_arg, const char *const *argv,
       pi.hProcess = pi.hThread = NULL;
       pi.dwProcessId = pi.dwThreadId = 0;
 
-      /* Set up needed handles for stdio */
-      si.dwFlags = STARTF_USESTDHANDLES;
-      si.hStdInput = handle ((in__stdin < 0 ? 0 : in__stdin), false);
-      si.hStdOutput = handle ((in__stdout < 0 ? 1 : in__stdout), true);
-      si.hStdError = handle (2, true);
-
-      si.cb = sizeof (si);
-
       c_flags = GetPriorityClass (GetCurrentProcess ());
       sigproc_printf ("priority class %d", c_flags);
 
       c_flags |= CREATE_SEPARATE_WOW_VDM | CREATE_UNICODE_ENVIRONMENT;
+
+      /* Add CREATE_DEFAULT_ERROR_MODE flag for non-Cygwin processes so they
+	 get the default error mode instead of inheriting the mode Cygwin
+	 uses.  This allows things like Windows Error Reporting/JIT debugging
+	 to work with processes launched from a Cygwin shell. */
+      if (!real_path.iscygexec ())
+	c_flags |= CREATE_DEFAULT_ERROR_MODE;
 
       /* We're adding the CREATE_BREAKAWAY_FROM_JOB flag here to workaround
 	 issues with the "Program Compatibility Assistant (PCA) Service".
@@ -537,8 +571,7 @@ child_info_spawn::worker (const char *prog_arg, const char *const *argv,
 	 in a console will break native processes running in the background,
 	 because the Ctrl-C event is sent to all processes in the console, unless
 	 they ignore it explicitely.  CREATE_NEW_PROCESS_GROUP does that for us. */
-      if (!iscygwin () && fhandler_console::exists ()
-	  && fhandler_console::tc_getpgid () != myself->pgid)
+      if (!iscygwin () && ctty_pgid && ctty_pgid != myself->pgid)
 	c_flags |= CREATE_NEW_PROCESS_GROUP;
       refresh_cygheap ();
 
@@ -566,6 +599,73 @@ child_info_spawn::worker (const char *prog_arg, const char *const *argv,
 	SetHandleInformation (my_wr_proc_pipe, HANDLE_FLAG_INHERIT, 0);
       parent_winpid = GetCurrentProcessId ();
 
+      PSECURITY_ATTRIBUTES sa = (PSECURITY_ATTRIBUTES) tp.w_get ();
+      if (!sec_user_nih (sa, cygheap->user.sid (),
+			 well_known_authenticated_users_sid,
+			 PROCESS_QUERY_LIMITED_INFORMATION))
+	sa = &sec_none_nih;
+
+      fhandler_pty_slave *ptys_primary = NULL;
+      for (int i = 0; i < 3; i ++)
+	{
+	  const int chk_order[] = {1, 0, 2};
+	  int fd = chk_order[i];
+	  fhandler_base *fh = ::cygheap->fdtab[fd];
+	  if (fh && fh->get_major () == DEV_PTYS_MAJOR)
+	    {
+	      fhandler_pty_slave *ptys = (fhandler_pty_slave *) fh;
+	      if (ptys_primary == NULL)
+		ptys_primary = ptys;
+	    }
+	  else if (fh && fh->get_major () == DEV_CONS_MAJOR)
+	    {
+	      fhandler_console *cons = (fhandler_console *) fh;
+	      if (wincap.has_con_24bit_colors () && !iscygwin ())
+		if (fd == 1 || fd == 2)
+		  cons->request_xterm_mode_output (false);
+	    }
+	}
+
+      if (!iscygwin ())
+	{
+	  cfd.rewind ();
+	  while (cfd.next () >= 0)
+	    if (cfd->get_major () == DEV_PTYS_MAJOR)
+	      {
+		fhandler_pty_slave *ptys =
+		  (fhandler_pty_slave *)(fhandler_base *) cfd;
+		ptys->setup_locale ();
+	      }
+	}
+
+      /* Set up needed handles for stdio */
+      si.dwFlags = STARTF_USESTDHANDLES;
+      si.hStdInput = handle ((in__stdin < 0 ? 0 : in__stdin), false);
+      si.hStdOutput = handle ((in__stdout < 0 ? 1 : in__stdout), true);
+      si.hStdError = handle (2, true);
+
+      si.cb = sizeof (si);
+
+      if (!iscygwin ())
+	init_console_handler (myself->ctty > 0);
+
+      bool enable_pcon = false;
+      STARTUPINFOEXW si_pcon;
+      ZeroMemory (&si_pcon, sizeof (si_pcon));
+      STARTUPINFOW *si_tmp = &si;
+      if (!iscygwin () && ptys_primary && is_console_app (runpath))
+	{
+	  bool nopcon = mode != _P_OVERLAY && mode != _P_WAIT;
+	  if (disable_pcon || !ptys_primary->term_has_pcon_cap (envblock))
+	    nopcon = true;
+	  if (ptys_primary->setup_pseudoconsole (&si_pcon, nopcon))
+	    {
+	      c_flags |= EXTENDED_STARTUPINFO_PRESENT;
+	      si_tmp = &si_pcon.StartupInfo;
+	      enable_pcon = true;
+	    }
+	}
+
     loop:
       /* When ruid != euid we create the new process under the current original
 	 account and impersonate in child, this way maintaining the different
@@ -586,15 +686,15 @@ child_info_spawn::worker (const char *prog_arg, const char *const *argv,
 	      && !::cygheap->user.groups.issetgroups ()
 	      && !::cygheap->user.setuid_to_restricted))
 	{
-	  rc = CreateProcessW (runpath,	  /* image name - with full path */
-			       cmd.wcs (wcmd),/* what was passed to exec */
-			       &sec_none_nih, /* process security attrs */
-			       &sec_none_nih, /* thread security attrs */
-			       TRUE,	  /* inherit handles from parent */
+	  rc = CreateProcessW (runpath,		/* image name w/ full path */
+			       cmd.wcs (wcmd),	/* what was passed to exec */
+			       sa,		/* process security attrs */
+			       sa,		/* thread security attrs */
+			       TRUE,		/* inherit handles */
 			       c_flags,
-			       envblock,	  /* environment */
+			       envblock,	/* environment */
 			       NULL,
-			       &si,
+			       si_tmp,
 			       &pi);
 	}
       else
@@ -640,15 +740,15 @@ child_info_spawn::worker (const char *prog_arg, const char *const *argv,
 	    }
 
 	  rc = CreateProcessAsUserW (::cygheap->user.primary_token (),
-			       runpath,	  /* image name - with full path */
-			       cmd.wcs (wcmd),/* what was passed to exec */
-			       &sec_none_nih, /* process security attrs */
-			       &sec_none_nih, /* thread security attrs */
-			       TRUE,	  /* inherit handles from parent */
+			       runpath,		/* image name w/ full path */
+			       cmd.wcs (wcmd),	/* what was passed to exec */
+			       sa,		/* process security attrs */
+			       sa,		/* thread security attrs */
+			       TRUE,		/* inherit handles */
 			       c_flags,
-			       envblock,	  /* environment */
+			       envblock,	/* environment */
 			       NULL,
-			       &si,
+			       si_tmp,
 			       &pi);
 	  if (hwst)
 	    {
@@ -660,6 +760,11 @@ child_info_spawn::worker (const char *prog_arg, const char *const *argv,
 	      SetThreadDesktop (hdsk_orig);
 	      CloseDesktop (hdsk);
 	    }
+	}
+      if (enable_pcon)
+	{
+	  DeleteProcThreadAttributeList (si_pcon.lpAttributeList);
+	  HeapFree (GetProcessHeap (), 0, si_pcon.lpAttributeList);
 	}
 
       if (mode != _P_OVERLAY)
@@ -721,16 +826,15 @@ child_info_spawn::worker (const char *prog_arg, const char *const *argv,
 	  myself->dwProcessId = pi.dwProcessId;
 	  strace.execing = 1;
 	  myself.hProcess = hExeced = pi.hProcess;
+	  HANDLE old_winpid_hdl = myself.shared_winpid_handle ();
 	  if (!real_path.iscygexec ())
 	    {
 	      /* If the child process is not a Cygwin process, we have to
-		 create a new winpid symlink and drop the old one on
-		 behalf of the child process not being able to do this
-		 by itself. */
-	      HANDLE old_winpid_hdl = myself.shared_winpid_handle ();
+		 create a new winpid symlink on behalf of the child process
+		 not being able to do this by itself. */
 	      myself.create_winpid_symlink ();
-	      NtClose (old_winpid_hdl);
 	    }
+	  NtClose (old_winpid_hdl);
 	  real_path.get_wide_win32_path (myself->progname); // FIXME: race?
 	  sigproc_printf ("new process name %W", myself->progname);
 	  if (!iscygwin ())
@@ -774,7 +878,8 @@ child_info_spawn::worker (const char *prog_arg, const char *const *argv,
 	  child->start_time = time (NULL); /* Register child's starting time. */
 	  child->nice = myself->nice;
 	  postfork (child);
-	  if (!child.remember (mode == _P_DETACH))
+	  if (mode != _P_DETACH
+	      && (!child.remember () || !child.attach ()))
 	    {
 	      /* FIXME: Child in strange state now */
 	      CloseHandle (pi.hProcess);
@@ -830,6 +935,13 @@ child_info_spawn::worker (const char *prog_arg, const char *const *argv,
 		  && WaitForSingleObject (pi.hProcess, 0) == WAIT_TIMEOUT)
 		wait_for_myself ();
 	    }
+	  if (sem)
+	    __posix_spawn_sem_release (sem, 0);
+	  if (enable_pcon)
+	    {
+	      WaitForSingleObject (pi.hProcess, INFINITE);
+	      ptys_primary->close_pseudoconsole ();
+	    }
 	  myself.exit (EXITCODE_NOSET);
 	  break;
 	case _P_WAIT:
@@ -837,6 +949,8 @@ child_info_spawn::worker (const char *prog_arg, const char *const *argv,
 	  system_call.arm ();
 	  if (waitpid (cygpid, &res, 0) != cygpid)
 	    res = -1;
+	  if (enable_pcon)
+	    ptys_primary->close_pseudoconsole ();
 	  break;
 	case _P_DETACH:
 	  res = 0;	/* Lost all memory of this child. */
@@ -862,6 +976,7 @@ child_info_spawn::worker (const char *prog_arg, const char *const *argv,
   this->cleanup ();
   if (envblock)
     free (envblock);
+
   return (int) res;
 }
 
@@ -1015,8 +1130,9 @@ extern "C" int
 spawnvp (int mode, const char *file, const char * const *argv)
 {
   path_conv buf;
-  return spawnve (mode | _P_PATH_TYPE_EXEC, find_exec (file, buf), argv,
-		  cur_environ ());
+  return spawnve (mode | _P_PATH_TYPE_EXEC,
+		  find_exec (file, buf, "PATH", FE_NNF) ?: "",
+		  argv, cur_environ ());
 }
 
 extern "C" int
@@ -1024,7 +1140,9 @@ spawnvpe (int mode, const char *file, const char * const *argv,
 	  const char * const *envp)
 {
   path_conv buf;
-  return spawnve (mode | _P_PATH_TYPE_EXEC, find_exec (file, buf), argv, envp);
+  return spawnve (mode | _P_PATH_TYPE_EXEC,
+		  find_exec (file, buf, "PATH", FE_NNF) ?: "",
+		  argv, envp);
 }
 
 int
@@ -1165,6 +1283,12 @@ av::setup (const char *prog_arg, path_conv& real_path, const char *ext,
 	  }
 	UnmapViewOfFile (buf);
   just_shell:
+	/* Check if script is executable.  Otherwise we start non-executable
+	   scripts successfully, which is incorrect behaviour. */
+	if (real_path.has_acls ()
+	    && check_file_access (real_path, X_OK, true) < 0)
+	  return -1;	/* errno is already set. */
+
 	if (!pgm)
 	  {
 	    if (!p_type_exec)
@@ -1180,12 +1304,6 @@ av::setup (const char *prog_arg, path_conv& real_path, const char *ext,
 	    pgm = (char *) "/bin/sh";
 	    arg1 = NULL;
 	  }
-
-	/* Check if script is executable.  Otherwise we start non-executable
-	   scripts successfully, which is incorrect behaviour. */
-	if (real_path.has_acls ()
-	    && check_file_access (real_path, X_OK, true) < 0)
-	  return -1;	/* errno is already set. */
 
 	/* Replace argv[0] with the full path to the script if this is the
 	   first time through the loop. */
@@ -1207,5 +1325,105 @@ av::setup (const char *prog_arg, path_conv& real_path, const char *ext,
 
 err:
   __seterrno ();
+  return -1;
+}
+
+/* The following __posix_spawn_* functions are called from newlib's posix_spawn
+   implementation.  The original code in newlib has been taken from FreeBSD,
+   and the core code relies on specific, non-portable behaviour of vfork(2).
+   Our replacement implementation uses a semaphore to synchronize parent and
+   child process.  Note: __posix_spawn_fork in fork.cc is part of the set. */
+
+/* Create an inheritable semaphore.  Set it to 0 (== non-signalled), so the
+   parent can wait on the semaphore immediately. */
+extern "C" int
+__posix_spawn_sem_create (void **semp)
+{
+  HANDLE sem;
+  OBJECT_ATTRIBUTES attr;
+  NTSTATUS status;
+
+  if (!semp)
+    return EINVAL;
+  InitializeObjectAttributes (&attr, NULL, OBJ_INHERIT, NULL, NULL);
+  status = NtCreateSemaphore (&sem, SEMAPHORE_ALL_ACCESS, &attr, 0, INT_MAX);
+  if (!NT_SUCCESS (status))
+    return geterrno_from_nt_status (status);
+  *semp = sem;
+  return 0;
+}
+
+/* Signal the semaphore.  "error" should be 0 if all went fine and the
+   exec'd child process is up and running, a useful POSIX error code otherwise.
+   After releasing the semaphore, the value of the semaphore reflects
+   the error code + 1.  Thus, after WFMO in__posix_spawn_sem_wait_and_close,
+   querying the value of the semaphore returns either 0 if all went well,
+   or a value > 0 equivalent to the POSIX error code. */
+extern "C" void
+__posix_spawn_sem_release (void *sem, int error)
+{
+  ReleaseSemaphore (sem, error + 1, NULL);
+}
+
+/* Helper to check the semaphore value. */
+static inline int
+__posix_spawn_sem_query (void *sem)
+{
+  SEMAPHORE_BASIC_INFORMATION sbi;
+
+  NtQuerySemaphore (sem, SemaphoreBasicInformation, &sbi, sizeof sbi, NULL);
+  return sbi.CurrentCount;
+}
+
+/* Called from parent to wait for fork/exec completion.  We're waiting for
+   the semaphore as well as the child's process handle, so even if the
+   child crashes without signalling the semaphore, we won't wait infinitely. */
+extern "C" int
+__posix_spawn_sem_wait_and_close (void *sem, void *proc)
+{
+  int ret = 0;
+  HANDLE w4[2] = { sem, proc };
+
+  switch (WaitForMultipleObjects (2, w4, FALSE, INFINITE))
+    {
+    case WAIT_OBJECT_0:
+      ret = __posix_spawn_sem_query (sem);
+      break;
+    case WAIT_OBJECT_0 + 1:
+      /* If we return here due to the child process dying, the semaphore is
+	 very likely not signalled.  Check this here and return a valid error
+	 code. */
+      ret = __posix_spawn_sem_query (sem);
+      if (ret == 0)
+	ret = ECHILD;
+      break;
+    default:
+      ret = geterrno_from_win_error ();
+      break;
+    }
+
+  CloseHandle (sem);
+  return ret;
+}
+
+/* Replacement for execve/execvpe, called from forked child in newlib's
+   posix_spawn.  The relevant difference is the additional semaphore
+   so the worker method (which is not supposed to return on success)
+   can signal the semaphore after sync'ing with the exec'd child. */
+extern "C" int
+__posix_spawn_execvpe (const char *path, char * const *argv, char *const *envp,
+		       HANDLE sem, int use_env_path)
+{
+  path_conv buf;
+
+  static char *const empty_env[] = { NULL };
+  if (!envp)
+    envp = empty_env;
+  ch_spawn.set_sem (sem);
+  ch_spawn.worker (use_env_path ? (find_exec (path, buf, "PATH", FE_NNF) ?: "")
+				: path,
+		   argv, envp,
+		   _P_OVERLAY | (use_env_path ? _P_PATH_TYPE_EXEC : 0));
+  __posix_spawn_sem_release (sem, errno);
   return -1;
 }

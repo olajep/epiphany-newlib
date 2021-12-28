@@ -155,52 +155,27 @@ rmdirs (WCHAR ntmaxpathbuf[NT_MAX_PATH])
    file name, as GetModuleFileNameW () yields the as-loaded name.
    While we have the file handle open, also read the attributes.
    NOTE: Uses dll_list::nt_max_path_buf (). */
-static bool
-stat_real_file_once (dll *d)
+bool
+dll::stat_real_file_once ()
 {
-  if (d->fbi.FileAttributes != INVALID_FILE_ATTRIBUTES)
+  if (fii.IndexNumber.QuadPart != -1LL)
     return true;
 
-  tmp_pathbuf tp;
-
-  HANDLE fhandle = INVALID_HANDLE_VALUE;
-  NTSTATUS status, fstatus;
-  PMEMORY_SECTION_NAME pmsi1;
-  MEMORY_SECTION_NAME msi2;
-  pmsi1 = (PMEMORY_SECTION_NAME) dll_list::nt_max_path_buf ();
-  RtlInitEmptyUnicodeString (&msi2.SectionFileName, tp.w_get (), 65535);
-
-  /* Retry opening the real file name until that does not change any more. */
-  status = NtQueryVirtualMemory (NtCurrentProcess (), d->handle,
-				 MemorySectionName, pmsi1, 65536, NULL);
-  while (NT_SUCCESS (status) &&
-	!RtlEqualUnicodeString (&msi2.SectionFileName,
-				&pmsi1->SectionFileName, FALSE))
-    {
-      RtlCopyUnicodeString (&msi2.SectionFileName, &pmsi1->SectionFileName);
-      if (fhandle != INVALID_HANDLE_VALUE)
-	NtClose (fhandle);
-      pmsi1->SectionFileName.Buffer[pmsi1->SectionFileName.Length] = L'\0';
-      fhandle = dll_list::ntopenfile (pmsi1->SectionFileName.Buffer, &fstatus);
-      status = NtQueryVirtualMemory (NtCurrentProcess (), d->handle,
-				     MemorySectionName, pmsi1, 65536, NULL);
-    }
-  if (!NT_SUCCESS (status))
-    system_printf ("WARNING: Unable (ntstatus %y) to query real file for %W",
-		   status, d->ntname);
-  else if (fhandle == INVALID_HANDLE_VALUE)
-    system_printf ("WARNING: Unable (ntstatus %y) to open real file for %W",
-		   fstatus, d->ntname);
+  NTSTATUS fstatus;
+  HANDLE fhandle = dll_list::ntopenfile (ntname, &fstatus);
   if (fhandle == INVALID_HANDLE_VALUE)
-    return false;
+    {
+      system_printf ("WARNING: Unable (ntstatus %y) to open real file %W",
+		     fstatus, ntname);
+      return false;
+    }
 
-  if (!dll_list::read_fii (fhandle, &d->fii) ||
-      !dll_list::read_fbi (fhandle, &d->fbi))
+  if (!dll_list::read_fii (fhandle, &fii))
     system_printf ("WARNING: Unable to read real file attributes for %W",
-		   pmsi1->SectionFileName.Buffer);
+		   ntname);
 
   NtClose (fhandle);
-  return d->fbi.FileAttributes != INVALID_FILE_ATTRIBUTES;
+  return fii.IndexNumber.QuadPart != -1LL;
 }
 
 /* easy use of NtOpenFile */
@@ -267,29 +242,6 @@ dll_list::read_fii (HANDLE fh, PFILE_INTERNAL_INFORMATION pfii)
   return true;
 }
 
-bool
-dll_list::read_fbi (HANDLE fh, PFILE_BASIC_INFORMATION pfbi)
-{
-  pfbi->FileAttributes = INVALID_FILE_ATTRIBUTES;
-  pfbi->LastWriteTime.QuadPart = -1LL;
-
-  NTSTATUS status;
-  IO_STATUS_BLOCK iosb;
-  status = NtQueryInformationFile (fh, &iosb,
-				   pfbi, sizeof (*pfbi),
-				   FileBasicInformation);
-  if (!NT_SUCCESS (status))
-    {
-      system_printf ("WARNING: %y = NtQueryInformationFile (%p,"
-		     " BasicInfo, io.Status %y)",
-		     status, fh, iosb.Status);
-      pfbi->FileAttributes = INVALID_FILE_ATTRIBUTES;
-      pfbi->LastWriteTime.QuadPart = -1LL;
-      return false;
-    }
-  return true;
-}
-
 /* Into buf if not NULL, write the IndexNumber in pli.
    Return the number of characters (that would be) written. */
 static int
@@ -340,30 +292,18 @@ exename (PWCHAR buf, ssize_t bufsize)
   return format_IndexNumber (buf, bufsize, &d->fii.IndexNumber);
 }
 
-/* Into buf if not NULL, write the newest dll's LastWriteTime.
+/* Into buf if not NULL, write the current Windows Thread Identifier.
    Return the number of characters (that would be) written. */
 static int
-lwtimename (PWCHAR buf, ssize_t bufsize)
+winthrname (PWCHAR buf, ssize_t bufsize)
 {
   if (!buf)
-    return sizeof (LARGE_INTEGER) * 2;
-  if (bufsize >= 0 && bufsize <= (int)sizeof (LARGE_INTEGER) * 2)
+    return sizeof (DWORD) * 4;
+  if (bufsize >= 0 && bufsize <= (int)sizeof (DWORD) * 4)
     return 0;
 
-  LARGE_INTEGER newest = { 0 };
-  /* Need by-handle-file-information for _all_ loaded dlls,
-     as most recent ctime forms the hardlinks directory. */
-  dll *d = &dlls.start;
-  while ((d = d->next))
-    {
-      /* LastWriteTime more properly tells the last file-content modification
-	 time, because a newly created hardlink may have a different
-	 CreationTime compared to the original file. */
-      if (d->fbi.LastWriteTime.QuadPart > newest.QuadPart)
-	newest = d->fbi.LastWriteTime;
-    }
-
-  return __small_swprintf (buf, L"%016X", newest);
+  return __small_swprintf (buf, L"%08X%08X",
+			   GetCurrentProcessId(), GetCurrentThreadId());
 }
 
 struct namepart {
@@ -382,7 +322,7 @@ forkable_nameparts[] = {
   { L"<sid>",         sidname,          true,  true,  },
   { L"<exe>",         exename,          false, false, },
   { MUTEXSEP,            NULL,          false, false, },
-  { L"<ctime>",    lwtimename,          true,  true,  },
+  { L"<winthr>",   winthrname,          true,  true,  },
 
   { NULL, NULL },
 };
@@ -532,17 +472,21 @@ dll_list::forkable_ntnamesize (dll_type type, PCWCHAR fullntname, PCWCHAR modnam
   if (cygwin_shared->forkable_hardlink_support == 0) /* Unknown */
     {
       /* check existence of forkables dir */
-      PWCHAR pbuf = nt_max_path_buf ();
+      /* nt_max_path_buf () is already used in dll_list::alloc.
+         But as this is run in the very first cygwin process only,
+	 using some heap is not a performance issue here. */
+      PWCHAR pbuf = (PWCHAR) cmalloc_abort (HEAP_BUF,
+					    NT_MAX_PATH * sizeof (WCHAR));
+      PWCHAR pnext = pbuf;
       for (namepart const *part = forkable_nameparts; part->text; ++part)
 	{
 	  if (part->textfunc)
-	    pbuf += part->textfunc (pbuf, -1);
+	    pnext += part->textfunc (pnext, -1);
 	  else
-	    pbuf += __small_swprintf (pbuf, L"%W", part->text);
+	    pnext += __small_swprintf (pnext, L"%W", part->text);
 	  if (part->mutex_from_dir)
 	    break; /* up to first mutex-naming dir */
 	}
-      pbuf = nt_max_path_buf ();
 
       UNICODE_STRING fn;
       RtlInitUnicodeString (&fn, pbuf);
@@ -564,6 +508,7 @@ dll_list::forkable_ntnamesize (dll_type type, PCWCHAR fullntname, PCWCHAR modnam
 	  cygwin_shared->forkable_hardlink_support = -1; /* No */
 	  debug_printf ("disabled, missing or not on NTFS %W", fn.Buffer);
 	}
+      cfree (pbuf);
     }
 
   if (!forkables_supported ())
@@ -616,10 +561,6 @@ dll_list::forkable_ntnamesize (dll_type type, PCWCHAR fullntname, PCWCHAR modnam
 void
 dll_list::prepare_forkables_nomination ()
 {
-  dll *d = &dlls.start;
-  while ((d = d->next))
-    stat_real_file_once (d); /* uses nt_max_path_buf () */
-
   PWCHAR pbuf = nt_max_path_buf ();
 
   bool needsep = false;

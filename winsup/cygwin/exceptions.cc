@@ -28,6 +28,7 @@ details. */
 #include "ntdll.h"
 #include "exception.h"
 #include "posix_timer.h"
+#include "gcc_seh.h"
 
 /* Definitions for code simplification */
 #ifdef __x86_64__
@@ -42,6 +43,7 @@ details. */
 
 #define CALL_HANDLER_RETRY_OUTER 10
 #define CALL_HANDLER_RETRY_INNER 10
+#define DUMPSTACK_FRAME_LIMIT    32
 
 PWCHAR debugger_command;
 extern uint8_t _sigbe;
@@ -382,7 +384,7 @@ cygwin_exception::dumpstack ()
 #else
       small_printf ("Stack trace:\r\nFrame     Function  Args\r\n");
 #endif
-      for (i = 0; i < 16 && thestack++; i++)
+      for (i = 0; i < DUMPSTACK_FRAME_LIMIT && thestack++; i++)
 	{
 	  small_printf (_AFMT "  " _AFMT, thestack.sf.AddrFrame.Offset,
 			thestack.sf.AddrPC.Offset);
@@ -392,7 +394,8 @@ cygwin_exception::dumpstack ()
 	  small_printf (")\r\n");
 	}
       small_printf ("End of stack trace%s\n",
-		    i == 16 ? " (more stack frames may be present)" : "");
+		    i == DUMPSTACK_FRAME_LIMIT ?
+		        " (more stack frames may be present)" : "");
       if (h)
 	NtClose (h);
     }
@@ -458,10 +461,8 @@ cygwin_stackdump ()
   exc.dumpstack ();
 }
 
-#define TIME_TO_WAIT_FOR_DEBUGGER 10000
-
 extern "C" int
-try_to_debug (bool waitloop)
+try_to_debug ()
 {
   if (!debugger_command)
     return 0;
@@ -529,13 +530,17 @@ try_to_debug (bool waitloop)
 			&si,
 			&pi);
 
+  /* We want to stop here and wait until the error_start process attaches.  But
+     we can't wait here for the error_start process to exit, as if it's a
+     debugger, it might want to continue this thread.  So we busy wait until a
+     debugger attaches, which stops this process, after which it can decide if
+     we continue or not. */
+
   *dbg_end = L'\0';
   if (!dbg)
     system_printf ("Failed to start debugger, %E");
   else
     {
-      if (!waitloop)
-	return dbg;
       SetThreadPriority (GetCurrentThread (), THREAD_PRIORITY_IDLE);
       while (!being_debugged ())
 	Sleep (1);
@@ -739,7 +744,7 @@ exception::handle (EXCEPTION_RECORD *e, exception_list *frame, CONTEXT *in,
 	 Linux behaviour and also makes a lot of sense on Windows. */
       if (me.altstack.ss_flags)
 	global_sigs[SIGSEGV].sa_handler = SIG_DFL;
-      /*FALLTHRU*/
+      fallthrough;
     case STATUS_ARRAY_BOUNDS_EXCEEDED:
     case STATUS_IN_PAGE_ERROR:
     case STATUS_NO_MEMORY:
@@ -759,6 +764,16 @@ exception::handle (EXCEPTION_RECORD *e, exception_list *frame, CONTEXT *in,
 	 if gcc ever supports Windows style structured exception
 	 handling.  */
       return ExceptionContinueExecution;
+
+#ifdef __x86_64__
+    case STATUS_GCC_THROW:
+    case STATUS_GCC_UNWIND:
+    case STATUS_GCC_FORCED:
+      /* According to a comment in the GCC function
+	 _Unwind_RaiseException(), GCC expects us to continue all the
+	 (continuable) GCC exceptions that reach us. */
+      return ExceptionContinueExecution;
+#endif
 
     default:
       /* If we don't recognize the exception, we have to assume that
@@ -799,7 +814,7 @@ exception::handle (EXCEPTION_RECORD *e, exception_list *frame, CONTEXT *in,
   if (exit_state >= ES_SIGNAL_EXIT
       && (NTSTATUS) e->ExceptionCode != STATUS_CONTROL_C_EXIT)
     api_fatal ("Exception during process exit");
-  else if (!try_to_debug (0))
+  else if (!try_to_debug ())
     rtl_unwind (frame, e);
   else
     {
@@ -812,7 +827,7 @@ exception::handle (EXCEPTION_RECORD *e, exception_list *frame, CONTEXT *in,
   /* POSIX requires that for SIGSEGV and SIGBUS, si_addr should be set to the
      address of faulting memory reference.  For SIGILL and SIGFPE these should
      be the address of the faulting instruction.  Other signals are apparently
-     undefined so we just set those to the faulting instruction too.  */ 
+     undefined so we just set those to the faulting instruction too.  */
   si.si_addr = (si.si_signo == SIGSEGV || si.si_signo == SIGBUS)
 	       ? (void *) e->ExceptionInformation[1] : (void *) in->_GR(ip);
   me.incyg++;
@@ -949,7 +964,7 @@ _cygtls::interrupt_setup (siginfo_t& si, void *handler, struct sigaction& siga)
   if (incyg)
     set_signal_arrived ();
 
-  if (!have_execed)
+  if (!have_execed && !(myself->exec_sendsig && !ch_spawn.iscygwin ()))
     proc_subproc (PROC_CLEARWAIT, 1);
   sigproc_printf ("armed signal_arrived %p, signal %d",
 		  signal_arrived, si.si_signo);
@@ -1134,7 +1149,7 @@ ctrl_c_handler (DWORD type)
      handled *by* the process group leader. */
   if (t && (!have_execed || have_execed_cygwin)
       && t->getpgid () == myself->pid &&
-      (GetTickCount () - t->last_ctrl_c) >= MIN_CTRL_C_SLOP)
+      (GetTickCount64 () - t->last_ctrl_c) >= MIN_CTRL_C_SLOP)
     /* Otherwise we just send a SIGINT to the process group and return TRUE
        (to indicate that we have handled the signal).  At this point, type
        should be a CTRL_C_EVENT or CTRL_BREAK_EVENT. */
@@ -1144,9 +1159,9 @@ ctrl_c_handler (DWORD type)
       if (type == CTRL_BREAK_EVENT
 	  && t->ti.c_cc[VINTR] == 3 && t->ti.c_cc[VQUIT] == 3)
 	sig = SIGQUIT;
-      t->last_ctrl_c = GetTickCount ();
+      t->last_ctrl_c = GetTickCount64 ();
       t->kill_pgrp (sig);
-      t->last_ctrl_c = GetTickCount ();
+      t->last_ctrl_c = GetTickCount64 ();
       return TRUE;
     }
 
@@ -1164,7 +1179,7 @@ extern "C" int
 sighold (int sig)
 {
   /* check that sig is in right range */
-  if (sig < 0 || sig >= NSIG)
+  if (sig < 0 || sig >= _NSIG)
     {
       set_errno (EINVAL);
       syscall_printf ("signal %d out of range", sig);
@@ -1180,7 +1195,7 @@ extern "C" int
 sigrelse (int sig)
 {
   /* check that sig is in right range */
-  if (sig < 0 || sig >= NSIG)
+  if (sig < 0 || sig >= _NSIG)
     {
       set_errno (EINVAL);
       syscall_printf ("signal %d out of range", sig);
@@ -1199,7 +1214,7 @@ sigset (int sig, _sig_func_ptr func)
   _sig_func_ptr prev;
 
   /* check that sig is in right range */
-  if (sig < 0 || sig >= NSIG || sig == SIGKILL || sig == SIGSTOP)
+  if (sig < 0 || sig >= _NSIG || sig == SIGKILL || sig == SIGSTOP)
     {
       set_errno (EINVAL);
       syscall_printf ("SIG_ERR = sigset (%d, %p)", sig, func);
@@ -1453,7 +1468,7 @@ sigpacket::process ()
 	    tls = NULL;
 	}
     }
-      
+
   /* !tls means no threads available to catch a signal. */
   if (!tls)
     {
@@ -1469,14 +1484,6 @@ sigpacket::process ()
   if (issig_wait)
     {
       tls->sigwait_mask = 0;
-      /* If the catching thread is running select on a signalfd, don't call
-	 the signal handler and don't remove the signal from the queue. */
-      if (tls->signalfd_select_wait)
-	{
-	  SetEvent (tls->signalfd_select_wait);
-	  rc = 0;
-	  goto done;
-	}
       goto dosig;
     }
 
@@ -1645,7 +1652,7 @@ _cygtls::call_signal_handler ()
       siginfo_t thissi = infodata;
       void (*thisfunc) (int, siginfo_t *, void *) = func;
 
-      ucontext_t *thiscontext = NULL;
+      ucontext_t *thiscontext = NULL, context_copy;
 
       /* Only make a context for SA_SIGINFO handlers */
       if (this_sa_flags & SA_SIGINFO)
@@ -1701,6 +1708,7 @@ _cygtls::call_signal_handler ()
 				    ? (uintptr_t) thissi.si_addr : 0;
 
 	  thiscontext = &context;
+	  context_copy = context;
 	}
 
       int this_errno = saved_errno;
@@ -1818,9 +1826,18 @@ _cygtls::call_signal_handler ()
 
       incyg = true;
 
-      set_signal_mask (_my_tls.sigmask, this_oldmask);
+      set_signal_mask (_my_tls.sigmask, (this_sa_flags & SA_SIGINFO)
+					? context.uc_sigmask : this_oldmask);
       if (this_errno >= 0)
 	set_errno (this_errno);
+      if (this_sa_flags & SA_SIGINFO)
+	{
+	  /* If more than just the sigmask in the context has been changed by
+	     the signal handler, call setcontext. */
+	  context_copy.uc_sigmask = context.uc_sigmask;
+	  if (memcmp (&context, &context_copy, sizeof context) != 0)
+	    setcontext (&context);
+	}
     }
 
   /* FIXME: Since 2011 this return statement always returned 1 (meaning
@@ -1865,7 +1882,8 @@ extern "C" int
 setcontext (const ucontext_t *ucp)
 {
   PCONTEXT ctx = (PCONTEXT) &ucp->uc_mcontext;
-  _my_tls.sigmask = ucp->uc_sigmask;
+  set_signal_mask (_my_tls.sigmask, ucp->uc_sigmask);
+  _my_tls.incyg = true;
 #ifdef __x86_64__
   /* Apparently a call to NtContinue works on 64 bit as well, but using
      RtlRestoreContext is the blessed way. */

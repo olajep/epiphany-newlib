@@ -32,6 +32,7 @@ if test -n "${machine_dir}"; then
 	cr16) AC_CONFIG_SUBDIRS(cr16) ;;
 	cris) AC_CONFIG_SUBDIRS(cris) ;;
 	crx) AC_CONFIG_SUBDIRS(crx) ;;
+	csky) AC_CONFIG_SUBDIRS(csky) ;;
 	d10v) AC_CONFIG_SUBDIRS(d10v) ;;
 	d30v) AC_CONFIG_SUBDIRS(d30v) ;;
 	epiphany) AC_CONFIG_SUBDIRS(epiphany) ;;
@@ -65,6 +66,7 @@ if test -n "${machine_dir}"; then
 	nvptx) AC_CONFIG_SUBDIRS(nvptx) ;;
 	or1k) AC_CONFIG_SUBDIRS(or1k) ;;
 	powerpc) AC_CONFIG_SUBDIRS(powerpc) ;;
+	pru) AC_CONFIG_SUBDIRS(pru) ;;
 	rl78) AC_CONFIG_SUBDIRS(rl78) ;;
 	rx) AC_CONFIG_SUBDIRS(rx) ;;
 	sh) AC_CONFIG_SUBDIRS(sh) ;;
