@@ -187,9 +187,9 @@ handle (int fd, bool writing)
   else if (cfd->close_on_exec ())
     h = INVALID_HANDLE_VALUE;
   else if (!writing)
-    h = cfd->get_handle ();
+    h = cfd->get_handle_nat ();
   else
-    h = cfd->get_output_handle ();
+    h = cfd->get_output_handle_nat ();
 
   return h;
 }
@@ -575,6 +575,9 @@ child_info_spawn::worker (const char *prog_arg, const char *const *argv,
 	c_flags |= CREATE_NEW_PROCESS_GROUP;
       refresh_cygheap ();
 
+      if (c_flags & CREATE_NEW_PROCESS_GROUP)
+	myself->process_state |= PID_NEW_PG;
+
       if (mode == _P_DETACH)
 	/* all set */;
       else if (mode != _P_OVERLAY || !my_wr_proc_pipe)
@@ -606,6 +609,9 @@ child_info_spawn::worker (const char *prog_arg, const char *const *argv,
 	sa = &sec_none_nih;
 
       fhandler_pty_slave *ptys_primary = NULL;
+      fhandler_console *cons_native = NULL;
+      termios *cons_ti = NULL;
+      pid_t cons_owner = 0;
       for (int i = 0; i < 3; i ++)
 	{
 	  const int chk_order[] = {1, 0, 2};
@@ -620,22 +626,104 @@ child_info_spawn::worker (const char *prog_arg, const char *const *argv,
 	  else if (fh && fh->get_major () == DEV_CONS_MAJOR)
 	    {
 	      fhandler_console *cons = (fhandler_console *) fh;
-	      if (wincap.has_con_24bit_colors () && !iscygwin ())
-		if (fd == 1 || fd == 2)
-		  cons->request_xterm_mode_output (false);
+	      if (!iscygwin ())
+		{
+		  if (cons_native == NULL)
+		    {
+		      cons_native = cons;
+		      cons_ti = &((tty *)cons->tc ())->ti;
+		      cons_owner = cons->get_owner ();
+		    }
+		  tty::cons_mode conmode =
+		    (ctty_pgid && ctty_pgid == myself->pgid) ?
+		    tty::native : tty::restore;
+		  if (fd == 0)
+		    fhandler_console::set_input_mode (conmode,
+					   cons_ti, cons->get_handle_set ());
+		  else if (fd == 1 || fd == 2)
+		    fhandler_console::set_output_mode (conmode,
+					   cons_ti, cons->get_handle_set ());
+		}
 	    }
 	}
+      struct fhandler_console::handle_set_t cons_handle_set = { 0, };
+      if (cons_native)
+	/* Console handles will be closed by close_all_files(),
+	   therefore, duplicate them here */
+	cons_native->get_duplicated_handle_set (&cons_handle_set);
 
       if (!iscygwin ())
 	{
+	  int fd;
 	  cfd.rewind ();
-	  while (cfd.next () >= 0)
+	  while ((fd = cfd.next ()) >= 0)
 	    if (cfd->get_major () == DEV_PTYS_MAJOR)
 	      {
 		fhandler_pty_slave *ptys =
 		  (fhandler_pty_slave *)(fhandler_base *) cfd;
+		ptys->create_invisible_console ();
 		ptys->setup_locale ();
 	      }
+	    else if (cfd->get_dev () == FH_PIPEW
+		     && (fd == (in__stdout < 0 ? 1 : in__stdout) || fd == 2))
+	      {
+		fhandler_pipe *pipe = (fhandler_pipe *)(fhandler_base *) cfd;
+		pipe->close_query_handle ();
+		pipe->set_pipe_non_blocking (false);
+	      }
+	    else if (cfd->get_dev () == FH_PIPER
+		     && fd == (in__stdin < 0 ? 0 : in__stdin))
+	      {
+		fhandler_pipe *pipe = (fhandler_pipe *)(fhandler_base *) cfd;
+		pipe->set_pipe_non_blocking (false);
+	      }
+	}
+
+      bool enable_pcon = false;
+      HANDLE ptys_from_master_nat = NULL;
+      HANDLE ptys_input_available_event = NULL;
+      HANDLE ptys_pcon_mutex = NULL;
+      HANDLE ptys_input_mutex = NULL;
+      tty *ptys_ttyp = NULL;
+      bool stdin_is_ptys = false;
+      if (!iscygwin () && ptys_primary && is_console_app (runpath))
+	{
+	  bool nopcon = mode != _P_OVERLAY && mode != _P_WAIT;
+	  if (disable_pcon || !ptys_primary->term_has_pcon_cap (envblock))
+	    nopcon = true;
+	  ptys_ttyp = ptys_primary->get_ttyp ();
+	  WaitForSingleObject (ptys_primary->pcon_mutex, INFINITE);
+	  if (ptys_primary->setup_pseudoconsole (nopcon))
+	    enable_pcon = true;
+	  ReleaseMutex (ptys_primary->pcon_mutex);
+	  HANDLE h_stdin = handle ((in__stdin < 0 ? 0 : in__stdin), false);
+	  if (h_stdin == ptys_primary->get_handle_nat ())
+	    stdin_is_ptys = true;
+	  ptys_from_master_nat = ptys_primary->get_handle_nat ();
+	  DuplicateHandle (GetCurrentProcess (), ptys_from_master_nat,
+			   GetCurrentProcess (), &ptys_from_master_nat,
+			   0, 0, DUPLICATE_SAME_ACCESS);
+	  ptys_input_available_event =
+	    ptys_primary->get_input_available_event ();
+	  DuplicateHandle (GetCurrentProcess (), ptys_input_available_event,
+			   GetCurrentProcess (), &ptys_input_available_event,
+			   0, 0, DUPLICATE_SAME_ACCESS);
+	  DuplicateHandle (GetCurrentProcess (), ptys_primary->pcon_mutex,
+			   GetCurrentProcess (), &ptys_pcon_mutex,
+			   0, 0, DUPLICATE_SAME_ACCESS);
+	  DuplicateHandle (GetCurrentProcess (), ptys_primary->input_mutex,
+			   GetCurrentProcess (), &ptys_input_mutex,
+			   0, 0, DUPLICATE_SAME_ACCESS);
+	  if (!enable_pcon && ptys_ttyp->getpgid () == myself->pgid
+	      && stdin_is_ptys
+	      && ptys_ttyp->pcon_input_state_eq (tty::to_cyg))
+	    {
+	      WaitForSingleObject (ptys_input_mutex, INFINITE);
+	      fhandler_pty_slave::transfer_input (tty::to_nat,
+				    ptys_primary->get_handle (),
+				    ptys_ttyp, ptys_input_available_event);
+	      ReleaseMutex (ptys_input_mutex);
+	    }
 	}
 
       /* Set up needed handles for stdio */
@@ -648,23 +736,6 @@ child_info_spawn::worker (const char *prog_arg, const char *const *argv,
 
       if (!iscygwin ())
 	init_console_handler (myself->ctty > 0);
-
-      bool enable_pcon = false;
-      STARTUPINFOEXW si_pcon;
-      ZeroMemory (&si_pcon, sizeof (si_pcon));
-      STARTUPINFOW *si_tmp = &si;
-      if (!iscygwin () && ptys_primary && is_console_app (runpath))
-	{
-	  bool nopcon = mode != _P_OVERLAY && mode != _P_WAIT;
-	  if (disable_pcon || !ptys_primary->term_has_pcon_cap (envblock))
-	    nopcon = true;
-	  if (ptys_primary->setup_pseudoconsole (&si_pcon, nopcon))
-	    {
-	      c_flags |= EXTENDED_STARTUPINFO_PRESENT;
-	      si_tmp = &si_pcon.StartupInfo;
-	      enable_pcon = true;
-	    }
-	}
 
     loop:
       /* When ruid != euid we create the new process under the current original
@@ -694,7 +765,7 @@ child_info_spawn::worker (const char *prog_arg, const char *const *argv,
 			       c_flags,
 			       envblock,	/* environment */
 			       NULL,
-			       si_tmp,
+			       &si,
 			       &pi);
 	}
       else
@@ -748,7 +819,7 @@ child_info_spawn::worker (const char *prog_arg, const char *const *argv,
 			       c_flags,
 			       envblock,	/* environment */
 			       NULL,
-			       si_tmp,
+			       &si,
 			       &pi);
 	  if (hwst)
 	    {
@@ -760,11 +831,6 @@ child_info_spawn::worker (const char *prog_arg, const char *const *argv,
 	      SetThreadDesktop (hdsk_orig);
 	      CloseDesktop (hdsk);
 	    }
-	}
-      if (enable_pcon)
-	{
-	  DeleteProcThreadAttributeList (si_pcon.lpAttributeList);
-	  HeapFree (GetProcessHeap (), 0, si_pcon.lpAttributeList);
 	}
 
       if (mode != _P_OVERLAY)
@@ -937,10 +1003,37 @@ child_info_spawn::worker (const char *prog_arg, const char *const *argv,
 	    }
 	  if (sem)
 	    __posix_spawn_sem_release (sem, 0);
-	  if (enable_pcon)
+	  if (enable_pcon || ptys_ttyp || cons_native)
+	    WaitForSingleObject (pi.hProcess, INFINITE);
+	  if (ptys_ttyp)
 	    {
-	      WaitForSingleObject (pi.hProcess, INFINITE);
-	      ptys_primary->close_pseudoconsole ();
+	      ptys_ttyp->wait_pcon_fwd ();
+	      if (ptys_ttyp->getpgid () == myself->pgid && stdin_is_ptys
+		  && ptys_ttyp->pcon_input_state_eq (tty::to_nat))
+		{
+		  WaitForSingleObject (ptys_input_mutex, INFINITE);
+		  fhandler_pty_slave::transfer_input (tty::to_cyg,
+					    ptys_from_master_nat, ptys_ttyp,
+					    ptys_input_available_event);
+		  ReleaseMutex (ptys_input_mutex);
+		}
+	      CloseHandle (ptys_from_master_nat);
+	      CloseHandle (ptys_input_mutex);
+	      CloseHandle (ptys_input_available_event);
+	      WaitForSingleObject (ptys_pcon_mutex, INFINITE);
+	      fhandler_pty_slave::close_pseudoconsole (ptys_ttyp);
+	      ReleaseMutex (ptys_pcon_mutex);
+	      CloseHandle (ptys_pcon_mutex);
+	    }
+	  if (cons_native)
+	    {
+	      tty::cons_mode conmode =
+		cons_owner == myself->pid ? tty::restore : tty::cygwin;
+	      fhandler_console::set_output_mode (conmode, cons_ti,
+						 &cons_handle_set);
+	      fhandler_console::set_input_mode (conmode, cons_ti,
+						&cons_handle_set);
+	      fhandler_console::close_handle_set (&cons_handle_set);
 	    }
 	  myself.exit (EXITCODE_NOSET);
 	  break;
@@ -949,8 +1042,36 @@ child_info_spawn::worker (const char *prog_arg, const char *const *argv,
 	  system_call.arm ();
 	  if (waitpid (cygpid, &res, 0) != cygpid)
 	    res = -1;
-	  if (enable_pcon)
-	    ptys_primary->close_pseudoconsole ();
+	  if (ptys_ttyp)
+	    {
+	      ptys_ttyp->wait_pcon_fwd ();
+	      if (ptys_ttyp->getpgid () == myself->pgid && stdin_is_ptys
+		  && ptys_ttyp->pcon_input_state_eq (tty::to_nat))
+		{
+		  WaitForSingleObject (ptys_input_mutex, INFINITE);
+		  fhandler_pty_slave::transfer_input (tty::to_cyg,
+					    ptys_from_master_nat, ptys_ttyp,
+					    ptys_input_available_event);
+		  ReleaseMutex (ptys_input_mutex);
+		}
+	      CloseHandle (ptys_from_master_nat);
+	      CloseHandle (ptys_input_mutex);
+	      CloseHandle (ptys_input_available_event);
+	      WaitForSingleObject (ptys_pcon_mutex, INFINITE);
+	      fhandler_pty_slave::close_pseudoconsole (ptys_ttyp);
+	      ReleaseMutex (ptys_pcon_mutex);
+	      CloseHandle (ptys_pcon_mutex);
+	    }
+	  if (cons_native)
+	    {
+	      tty::cons_mode conmode =
+		cons_owner == myself->pid ? tty::restore : tty::cygwin;
+	      fhandler_console::set_output_mode (conmode, cons_ti,
+						 &cons_handle_set);
+	      fhandler_console::set_input_mode (conmode, cons_ti,
+						&cons_handle_set);
+	      fhandler_console::close_handle_set (&cons_handle_set);
+	    }
 	  break;
 	case _P_DETACH:
 	  res = 0;	/* Lost all memory of this child. */
@@ -1175,6 +1296,13 @@ av::setup (const char *prog_arg, path_conv& real_path, const char *ext,
 			     FILE_SYNCHRONOUS_IO_NONALERT
 			     | FILE_OPEN_FOR_BACKUP_INTENT
 			     | FILE_NON_DIRECTORY_FILE);
+	if (status == STATUS_IO_REPARSE_TAG_NOT_HANDLED)
+	  {
+	    /* This is most likely an app execution alias (such as the
+	       Windows Store version of Python, i.e. not a Cygwin program */
+	    real_path.set_cygexec (false);
+	    break;
+	  }
 	if (!NT_SUCCESS (status))
 	  {
 	    /* File is not readable?  Doesn't mean it's not executable.

@@ -22,15 +22,6 @@ details. */
 #include "clock.h"
 
 static long
-get_open_max (int in)
-{
-  long max = getdtablesize ();
-  if (max < OPEN_MAX)
-    max = OPEN_MAX;
-  return max;
-}
-
-static long
 get_page_size (int in)
 {
   return wincap.allocation_granularity ();
@@ -51,28 +42,6 @@ __nt_query_system (PSYSTEM_BASIC_INFORMATION psbi)
 static long
 get_nproc_values (int in)
 {
-  if (!wincap.has_processor_groups ())	/* Pre Windows 7 */
-    {
-      SYSTEM_BASIC_INFORMATION sbi;
-
-      if (!__nt_query_system (&sbi))
-	return -1;
-      switch (in)
-	{
-	case _SC_NPROCESSORS_CONF:
-	  return sbi.NumberProcessors;
-	case _SC_NPROCESSORS_ONLN:
-	  {
-	    int i = 0;
-	    do
-	     if (sbi.ActiveProcessors & 1)
-	       i++;
-	    while (sbi.ActiveProcessors >>= 1);
-	    return i;
-	  }
-	}
-    }
-
   tmp_pathbuf tp;
   PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX lpi, plpi;
   DWORD lpi_size = NT_MAX_PATH;
@@ -520,7 +489,7 @@ static struct
   {cons, {c:CHILD_MAX}},		/*   1, _SC_CHILD_MAX */
   {cons, {c:CLOCKS_PER_SEC}},		/*   2, _SC_CLK_TCK */
   {cons, {c:NGROUPS_MAX}},		/*   3, _SC_NGROUPS_MAX */
-  {func, {f:get_open_max}},		/*   4, _SC_OPEN_MAX */
+  {cons, {c:OPEN_MAX}},		/*   4, _SC_OPEN_MAX */
   {cons, {c:_POSIX_JOB_CONTROL}},	/*   5, _SC_JOB_CONTROL */
   {cons, {c:_POSIX_SAVED_IDS}},		/*   6, _SC_SAVED_IDS */
   {cons, {c:_POSIX_VERSION}},		/*   7, _SC_VERSION */

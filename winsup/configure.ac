@@ -10,8 +10,10 @@ dnl Process this file with autoconf to produce a configure script.
 
 AC_PREREQ([2.59])
 AC_INIT([Cygwin],[0],[cygwin@cygwin.com],[cygwin],[https://cygwin.com])
-AC_CONFIG_SRCDIR(Makefile.in)
 AC_CONFIG_AUX_DIR(..)
+AC_CANONICAL_TARGET
+AM_INIT_AUTOMAKE([dejagnu foreign no-define no-dist subdir-objects -Wall -Wno-portability -Wno-extra-portability])
+AM_SILENT_RULES([yes])
 
 realdirpath() {
     test -z "$1" && return 1
@@ -26,13 +28,15 @@ realdirpath() {
 winsup_srcdir="$(realdirpath $srcdir)"
 target_builddir="$(realdirpath ..)"
 
-AC_PROG_INSTALL
 AC_NO_EXECUTABLES
-AC_CANONICAL_TARGET
 
+AC_PROG_INSTALL
+AC_PROG_MKDIR_P
 AC_PROG_CC
 AC_PROG_CXX
 AC_PROG_CPP
+AM_PROG_AS
+
 AC_LANG(C)
 AC_LANG(C++)
 
@@ -40,7 +44,7 @@ AC_ARG_WITH([cross-bootstrap],[AS_HELP_STRING([--with-cross-bootstrap],[do not b
 
 AC_CYGWIN_INCLUDES
 
-AC_CONFIG_HEADER(cygwin/config.h)
+AC_CONFIG_HEADERS([cygwin/config.h])
 
 AC_CHECK_TOOL(AR, ar, ar)
 AC_CHECK_TOOL(AS, as, as)
@@ -54,7 +58,7 @@ AC_CHECK_TOOL(STRIP, strip, strip)
 AC_CHECK_TOOL(WINDRES, windres, windres)
 
 AC_ARG_ENABLE(debugging,
-[ --enable-debugging		Build a cygwin DLL which has more consistency checking for debugging],
+[AS_HELP_STRING([--enable-debugging],[Build a cygwin DLL which has more consistency checking for debugging])],
 [case "${enableval}" in
 yes)	 AC_DEFINE([DEBUGGING],[1],[Define if DEBUGGING support is requested.]) ;;
 no)	 ;;
@@ -82,7 +86,32 @@ AC_SUBST(DEF_DLL_ENTRY)
 AC_SUBST(DIN_FILE)
 AC_SUBST(TLSOFFSETS_H)
 
-AC_CHECK_PROGS([DOCBOOK2XTEXI], [docbook2x-texi db2x_docbook2texi], [true])
+AM_CONDITIONAL(TARGET_X86_64, [test $target_cpu = "x86_64"])
+
+AC_ARG_ENABLE(doc,
+	      [AS_HELP_STRING([--enable-doc], [Build documentation])],,
+	      enable_doc=yes)
+AM_CONDITIONAL(BUILD_DOC, [test $enable_doc != "no"])
+
+AC_CHECK_PROGS([DOCBOOK2XTEXI], [docbook2x-texi db2x_docbook2texi])
+if test -z "$DOCBOOK2XTEXI" ; then
+    if test "x$enable_doc" != "xno"; then
+        AC_MSG_ERROR([docbook2texi is required to build documentation])
+    else
+        unset DOCBOOK2XTEXI
+        AM_MISSING_PROG([DOCBOOK2XTEXI], [docbook2texi])
+    fi
+fi
+
+AC_CHECK_PROGS([XMLTO], [xmlto])
+if test -z "$XMLTO"; then
+    if test "x$enable_doc" != "xno"; then
+        AC_MSG_ERROR([xmlto is required to build documentation])
+    else
+        unset XMLTO
+        AM_MISSING_PROG([XMLTO], [xmlto])
+    fi
+fi
 
 if test "x$with_cross_bootstrap" != "xyes"; then
     AC_CHECK_PROGS(MINGW_CXX, ${target_cpu}-w64-mingw32-g++)
@@ -90,7 +119,14 @@ if test "x$with_cross_bootstrap" != "xyes"; then
     AC_CHECK_PROGS(MINGW_CC, ${target_cpu}-w64-mingw32-gcc)
     test -n "$MINGW_CC" || AC_MSG_ERROR([no acceptable MinGW gcc found in \$PATH])
 fi
+AM_CONDITIONAL(CROSS_BOOTSTRAP, [test "x$with_cross_bootstrap" != "xyes"])
+
 AC_EXEEXT
+
+AC_CHECK_LIB([bfd], [bfd_init], [true],
+	     AC_MSG_WARN([Not building dumper.exe since some required libraries or headers are missing]))
+
+AM_CONDITIONAL(BUILD_DUMPER, [test "x$ac_cv_lib_bfd_bfd_init" = "xyes"])
 
 AC_CONFIG_FILES([
     Makefile
@@ -98,7 +134,9 @@ AC_CONFIG_FILES([
     cygserver/Makefile
     doc/Makefile
     utils/Makefile
+    utils/mingw/Makefile
     testsuite/Makefile
+    testsuite/cygrun/Makefile
 ])
 
 AC_OUTPUT

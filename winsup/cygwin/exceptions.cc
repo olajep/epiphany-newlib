@@ -902,7 +902,9 @@ sig_handle_tty_stop (int sig, siginfo_t *, void *)
 	 thread. */
       /* Use special cygwait parameter to handle SIGCONT.  _main_tls.sig will
 	 be cleared under lock when SIGCONT is detected.  */
+      pthread::suspend_all_except_self ();
       DWORD res = cygwait (NULL, cw_infinite, cw_sig_cont);
+      pthread::resume_all ();
       switch (res)
 	{
 	case WAIT_SIGNALED:
@@ -1161,6 +1163,7 @@ ctrl_c_handler (DWORD type)
 	sig = SIGQUIT;
       t->last_ctrl_c = GetTickCount64 ();
       t->kill_pgrp (sig);
+      t->output_stopped = false;
       t->last_ctrl_c = GetTickCount64 ();
       return TRUE;
     }

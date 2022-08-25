@@ -15,7 +15,7 @@ details. */
 #include "cygheap.h"
 #include "devices.h"
 
-#define _COMPILING_NEWLIB
+#define _LIBC
 #include <dirent.h>
 
 #define dev_prefix_len (sizeof ("/dev"))
@@ -105,6 +105,13 @@ fhandler_dev::fstatvfs (struct statvfs *sfs)
   if (opened)
     close ();
   return ret;
+}
+
+int
+fhandler_dev::rmdir ()
+{
+  set_errno (ENOTEMPTY);
+  return -1;
 }
 
 DIR *
